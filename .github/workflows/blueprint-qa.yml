@@ -211,7 +211,7 @@ jobs:
     name: Notebook Execution
     needs: preflight
     if: needs.preflight.outputs.preflight_passed == 'true'
-    runs-on: arc-runners-org-nvidia-ai-bp-4-gpu
+    runs-on: arc-runners-org-nvidia-ai-bp-5-gpu
     timeout-minutes: 240
 
     steps:
