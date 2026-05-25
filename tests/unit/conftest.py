@@ -170,7 +170,7 @@ def mock_es_client():
         patch("src.lib.integration.es_client.get_es_client", return_value=mock_instance),
         patch("src.lib.integration.record_exporter.get_es_client", return_value=mock_instance),
         patch("src.lib.flywheel.icl_selection.get_es_client", return_value=mock_instance),
-        patch("src.tasks.tasks.get_es_client", return_value=mock_instance),
+        patch("src.tasks.tasks.get_es_client", return_value=mock_instance, create=True),
         patch("src.lib.integration.es_client.index_embeddings_to_es", return_value="test_index"),
         patch("src.lib.integration.es_client.search_similar_embeddings", return_value=[]),
         patch("src.lib.integration.es_client.delete_embeddings_index", return_value=None),

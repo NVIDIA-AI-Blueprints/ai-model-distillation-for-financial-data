@@ -500,6 +500,47 @@ def test_identify_workload_type_with_keyerror():
     assert result == WorkloadClassification.TOOL_CALLING
 
 
+_CLASSIFICATION_RECORDS: list[Record] = [
+    {
+        "request": {"messages": [{"role": "user", "content": "headline"}]},
+        "response": {"choices": [{"message": {"content": "earnings"}}]},
+    },
+]
+_TOOL_CALLING_RECORDS: list[Record] = [
+    {
+        "request": {"messages": [{"role": "user", "content": "do x"}]},
+        "response": {
+            "choices": [{"message": {"tool_calls": [{"function": {"name": "do_x"}}]}}]
+        },
+    },
+]
+
+
+@pytest.mark.T5614423
+def test_identify_workload_type_auto_detect_classification():
+    assert (
+        identify_workload_type(_CLASSIFICATION_RECORDS, config_override="auto")
+        == WorkloadClassification.CLASSIFICATION
+    )
+
+
+@pytest.mark.T5614423
+def test_identify_workload_type_auto_detect_tool_calling():
+    assert (
+        identify_workload_type(_TOOL_CALLING_RECORDS, config_override="auto")
+        == WorkloadClassification.TOOL_CALLING
+    )
+
+
+@pytest.mark.T5614423
+def test_identify_workload_type_tool_calling_override_raises_on_classification_data():
+    with pytest.raises(ValueError) as exc:
+        identify_workload_type(_CLASSIFICATION_RECORDS, config_override="tool_calling")
+    msg = str(exc.value).lower()
+    assert "classification" in msg
+    assert "auto" in msg
+
+
 def test_format_training_data_basic():
     """Test basic functionality of format_training_data."""
     records: list[Record] = [

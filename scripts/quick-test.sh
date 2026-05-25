@@ -1,5 +1,6 @@
 #!/bin/bash
+set -euo pipefail
 
-curl http://localhost:8001/jobs \
+curl http://localhost:8000/api/jobs \
   -H 'Content-Type: application/json' \
-  -d '{"workload_id": "aiva_1"}'
+  -d '{"workload_id": "primary_assistant", "client_id": "aiva-1"}'

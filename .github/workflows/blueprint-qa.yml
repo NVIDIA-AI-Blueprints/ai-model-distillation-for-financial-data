@@ -1,0 +1,1364 @@
+# =============================================================================
+# AI Model Distillation for Financial Data — CI Pipeline
+# =============================================================================
+#
+# Pipeline = three jobs:
+#   1. Preflight (ubuntu-latest, ~2 min)   — secret + file sanity checks
+#   2. Notebook CI (GPU runner, ~60-90 min) — runs the notebook end-to-end,
+#      then 3 pytest layers against the deployed stack
+#   3. Summary (ubuntu-latest, ~1 min)     — artifacts + email notification
+#
+# Test layers (all AI-MDFD scoped, markers T5550841..T5614424):
+#   - Notebook E2E              (deploy + train + inference)
+#   - QA-image pytest (shared)  (3 real API cases + 7 skip stubs)
+#   - tests/unit                (white-box: identify_workload_type)
+#   - tests/integration         (host-side: worker SIGTERM)
+#
+# Runtime mutations (source files in git are NOT modified):
+#   - Preprocess notebook cells: 5, 7, 9, 10, 15, 30, 98
+#   - Patch deploy-nmp.sh in 7 places (systemd guard, ImagePull tolerance,
+#     kube-rbac-proxy registry, Docker Hub auth propagation, image load,
+#     helm timeout, volcano imagePullPolicy)
+#   - Patch config.yaml (eval_size, min_total_records, batch_size for the
+#     small CI dataset)
+#
+# Required secrets:
+#   NVIDIA_API_KEY, NGC_API_KEY, MONGO_USERNAME, MONGO_PASSWORD,
+#   REDIS_PASSWORD, DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+# Optional: HF_TOKEN, SMTP_*, TEST_DOCKER_PULL_KEY
+#
+# Hardware (ARC runner): 2x A100/H100/H200/B200, >=200GB disk, >=64GB RAM,
+#                        GPU driver >= 560.35.03, runner mounts host docker.sock.
+# =============================================================================
+
+name: Blueprint QA
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "deploy/**"
+      - "config/**"
+      - "tests/**"
+      - "notebooks/**"
+      - "scripts/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/blueprint-qa.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "deploy/**"
+      - "config/**"
+      - "tests/**"
+      - "notebooks/**"
+      - "scripts/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/blueprint-qa.yml"
+  workflow_dispatch:
+    inputs:
+      run_shared_qa:
+        description: "Run shared QA-image pytest after the notebook completes"
+        required: false
+        default: true
+        type: boolean
+      keep_stack:
+        description: "Keep Docker Compose / Minikube resources after the job (skip cleanup)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+  NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+  MONGO_USERNAME: ${{ secrets.MONGO_USERNAME }}
+  MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+  REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+  ES_COLLECTION_NAME: flywheel
+  TAG: "0.3.0"
+  ENABLE_EMAIL_NOTIFICATION: true
+  API_URL: http://localhost:8000
+  QA_TEST_IMAGE: nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image:latest
+  TEST_REPORT_DIR: test_reports
+
+jobs:
+  # ===========================================================================
+  # PREFLIGHT: Validate prerequisites on a cheap runner before burning GPU time
+  # ===========================================================================
+  preflight:
+    name: Preflight Checks
+    runs-on: ubuntu-latest
+    outputs:
+      preflight_passed: ${{ steps.preflight.outputs.passed }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Preflight Checks
+        id: preflight
+        run: |
+          echo "========================================"
+          echo "  PREFLIGHT CHECKS"
+          echo "========================================"
+          echo ""
+
+          FAILED=0
+
+          # Check 1: Required secrets
+          echo "--- [Check 1/5] Required Secrets ---"
+          for SECRET_NAME in NVIDIA_API_KEY NGC_API_KEY MONGO_USERNAME MONGO_PASSWORD REDIS_PASSWORD; do
+            VAL="${!SECRET_NAME}"
+            if [ -z "$VAL" ]; then
+              echo "FAIL: $SECRET_NAME is not set"
+              FAILED=1
+            else
+              echo "PASS: $SECRET_NAME is set"
+            fi
+          done
+
+          if [ -z "$HF_TOKEN" ]; then
+            echo "WARN: HF_TOKEN is not set (optional)"
+          else
+            echo "PASS: HF_TOKEN is set"
+          fi
+          echo ""
+
+          # Check 2: NGC Docker login (validates key, not just existence)
+          echo "--- [Check 2/5] NGC Registry Access ---"
+          if [ -n "$NGC_API_KEY" ]; then
+            if echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin 2>&1; then
+              echo "PASS: NGC Docker login successful"
+            else
+              echo "FAIL: NGC Docker login failed (key may be invalid or expired)"
+              FAILED=1
+            fi
+          else
+            echo "SKIP: NGC_API_KEY not set (already flagged above)"
+          fi
+          echo ""
+
+          # Check 3: Required files
+          echo "--- [Check 3/5] Required Files ---"
+          for FILE in \
+            notebooks/ai-model-distillation-financial-data.ipynb \
+            scripts/deploy-nmp.sh \
+            deploy/docker-compose.yaml \
+            notebooks/requirements.txt \
+            config/config.yaml; do
+            if [ -f "$FILE" ]; then
+              echo "PASS: $FILE"
+            else
+              echo "FAIL: $FILE not found"
+              FAILED=1
+            fi
+          done
+          echo ""
+
+          # Check 4: Notebook structure sanity
+          echo "--- [Check 4/5] Notebook Sanity ---"
+          CELL_COUNT=$(python3 -c "import json; nb=json.load(open('notebooks/ai-model-distillation-financial-data.ipynb')); print(len(nb['cells']))")
+          echo "Notebook has $CELL_COUNT cells"
+          if [ "$CELL_COUNT" -lt 50 ]; then
+            echo "FAIL: Notebook has fewer cells than expected (possible corruption)"
+            FAILED=1
+          else
+            echo "PASS: Cell count looks reasonable"
+          fi
+          echo ""
+
+          # Check 5: Notebook runner available
+          echo "--- [Check 5/5] Notebook Runner ---"
+          git clone --depth 1 https://x-access-token:${{ github.token }}@github.com/bp-cicd-org/qa-tester.git _qa_tester
+          if [ -f "_qa_tester/utils/notebook_runner/notebook_runner_nbclient.py" ]; then
+            echo "PASS: notebook_runner_nbclient.py found"
+          else
+            echo "FAIL: notebook_runner_nbclient.py not found in qa-tester"
+            FAILED=1
+          fi
+          rm -rf _qa_tester
+          echo ""
+
+          # Final
+          echo "========================================"
+          if [ $FAILED -eq 0 ]; then
+            echo "ALL PREFLIGHT CHECKS PASSED"
+            echo "passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "PREFLIGHT CHECKS FAILED"
+            echo "passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "========================================"
+
+  # ===========================================================================
+  # NOTEBOOK CI: Full end-to-end notebook execution on GPU runner
+  # ===========================================================================
+  notebook-ci:
+    name: Notebook Execution
+    needs: preflight
+    if: needs.preflight.outputs.preflight_passed == 'true'
+    runs-on: arc-runners-org-nvidia-ai-bp-4-gpu
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # =====================================================================
+      # Phase 1: GPU Runner Preflight — check & install ALL prerequisites
+      # before any real work begins. Fail fast if anything critical is missing.
+      # =====================================================================
+      - name: "GPU Runner Preflight: Validate & Prepare Environment"
+        run: |
+          echo "========================================"
+          echo "  GPU RUNNER PREFLIGHT"
+          echo "========================================"
+          FAILED=0
+          mkdir -p "$HOME/.local/bin"
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+          # --- Runner Info ---
+          echo ""
+          echo "--- [Info] Runner Environment ---"
+          echo "Hostname: $(hostname)"
+          echo "Kernel:   $(uname -r)"
+          echo "User:     $(whoami) (uid=$(id -u))"
+          echo "Disk:     $(df -BG / | awk 'NR==2 {print $4}') available"
+          echo "Memory:   $(free -h | awk 'NR==2 {print $7}') available"
+
+          # --- [1/9] Docker ---
+          echo ""
+          echo "--- [1/9] Docker ---"
+          if command -v docker &>/dev/null; then
+            DOCKER_VER=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo "0")
+            echo "Docker version: $DOCKER_VER"
+            if [[ "$(printf '%s\n' "27.0.0" "$DOCKER_VER" | sort -V | head -n1)" == "27.0.0" ]]; then
+              echo "PASS: Docker >= 27.0.0"
+            else
+              echo "FAIL: Docker >= 27.0.0 required (found $DOCKER_VER)"
+              FAILED=1
+            fi
+            echo "Compose: $(docker compose version 2>/dev/null || echo 'not found')"
+          else
+            echo "FAIL: Docker not found"
+            FAILED=1
+          fi
+
+          # --- [2/9] GPU Access ---
+          echo ""
+          echo "--- [2/9] GPU Access (via Docker) ---"
+          GPU_INFO=$(docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 \
+            nvidia-smi --query-gpu=index,name,memory.total,driver_version \
+            --format=csv,noheader 2>&1) || true
+          GPU_COUNT=$(echo "$GPU_INFO" | grep -c "," || echo "0")
+          if [ "$GPU_COUNT" -ge 2 ]; then
+            echo "$GPU_INFO"
+            echo "PASS: $GPU_COUNT GPUs accessible (>= 2 required)"
+          else
+            echo "FAIL: Need >= 2 GPUs, found $GPU_COUNT"
+            echo "$GPU_INFO"
+            FAILED=1
+          fi
+
+          # --- [3/9] nvidia-ctk ---
+          echo ""
+          echo "--- [3/9] NVIDIA Container Toolkit (nvidia-ctk) ---"
+          if command -v nvidia-ctk &>/dev/null; then
+            echo "PASS: nvidia-ctk $(nvidia-ctk --version 2>&1 | head -1)"
+          else
+            echo "WARN: nvidia-ctk not on PATH — attempting install..."
+            curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+              | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null
+            curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+              | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+              | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null 2>&1
+            sudo apt-get update -qq 2>/dev/null && sudo apt-get install -y -qq nvidia-container-toolkit 2>/dev/null
+            if command -v nvidia-ctk &>/dev/null; then
+              echo "PASS: nvidia-ctk installed — $(nvidia-ctk --version 2>&1 | head -1)"
+            else
+              echo "FAIL: nvidia-ctk could not be installed"
+              echo "      deploy-nmp.sh requires nvidia-ctk for GPU passthrough to minikube"
+              FAILED=1
+            fi
+          fi
+
+          # --- [4/9] Python ---
+          echo ""
+          echo "--- [4/9] Python ---"
+          if command -v python3 &>/dev/null; then
+            echo "PASS: $(python3 --version)"
+          else
+            echo "FAIL: python3 not found"
+            FAILED=1
+          fi
+
+          # --- [5/9] uv ---
+          echo ""
+          echo "--- [5/9] uv (Python package installer) ---"
+          if command -v uv &>/dev/null; then
+            echo "PASS: uv $(uv --version 2>&1)"
+          else
+            echo "Installing uv..."
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            if command -v uv &>/dev/null; then
+              echo "PASS: uv installed — $(uv --version 2>&1)"
+            else
+              echo "FAIL: uv could not be installed"
+              FAILED=1
+            fi
+          fi
+
+          # --- [6/9] jq & yq ---
+          echo ""
+          echo "--- [6/9] jq & yq ---"
+          for tool in jq yq; do
+            if command -v "$tool" &>/dev/null; then
+              echo "PASS: $tool already at $(command -v $tool)"
+            else
+              echo "Installing $tool..."
+              case "$tool" in
+                jq)
+                  curl -fsSL -o "$HOME/.local/bin/jq" \
+                    https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
+                  chmod +x "$HOME/.local/bin/jq"
+                  ;;
+                yq)
+                  curl -fsSL -o "$HOME/.local/bin/yq" \
+                    https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+                  chmod +x "$HOME/.local/bin/yq"
+                  ;;
+              esac
+              if command -v "$tool" &>/dev/null; then
+                echo "PASS: $tool installed — $($tool --version 2>&1 | head -1)"
+              else
+                echo "FAIL: $tool could not be installed"
+                FAILED=1
+              fi
+            fi
+          done
+
+          # --- [7/9] huggingface-cli ---
+          # deploy-nmp.sh accepts either the CLI binary or the importable
+          # Python module. On ARC runners /usr/local/bin is read-only, so pip
+          # installs the module but can't write the CLI script. We mirror
+          # deploy-nmp.sh's own fallback: CLI binary OR importable module.
+          echo ""
+          echo "--- [7/9] huggingface-cli ---"
+          if command -v huggingface-cli &>/dev/null; then
+            echo "PASS: huggingface-cli at $(command -v huggingface-cli)"
+          elif python3 -c "import huggingface_hub" 2>/dev/null; then
+            echo "PASS: huggingface_hub module already importable"
+          else
+            echo "Installing huggingface_hub..."
+            pip3 install --break-system-packages huggingface_hub 2>&1 || true
+            export PATH="$HOME/.local/bin:$PATH"
+            if command -v huggingface-cli &>/dev/null; then
+              echo "PASS: huggingface-cli installed"
+            elif python3 -c "import huggingface_hub" 2>/dev/null; then
+              echo "PASS: huggingface_hub module installed (CLI not on PATH, but deploy-nmp.sh accepts module)"
+            else
+              echo "FAIL: huggingface_hub could not be installed"
+              echo "      deploy-nmp.sh requires huggingface-cli or importable huggingface_hub module"
+              FAILED=1
+            fi
+          fi
+
+          # --- [8/9] NGC Docker Login ---
+          echo ""
+          echo "--- [8/9] NGC Docker Registry ---"
+          if echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin 2>&1; then
+            echo "PASS: NGC Docker login successful"
+          else
+            echo "FAIL: NGC Docker login failed"
+            FAILED=1
+          fi
+
+          # --- [9/9] Disk Space ---
+          echo ""
+          echo "--- [9/9] Disk Space ---"
+          FREE_GB=$(df -BG / | awk 'NR==2 {gsub(/G/,""); print $4}')
+          if [ "$FREE_GB" -ge 100 ]; then
+            echo "PASS: ${FREE_GB}G free (>= 100G required)"
+          else
+            echo "WARN: Only ${FREE_GB}G free — may run out during deployment"
+          fi
+
+          # --- Final Verdict ---
+          echo ""
+          echo "========================================"
+          if [ $FAILED -eq 0 ]; then
+            echo "  ALL GPU RUNNER PREFLIGHT CHECKS PASSED"
+          else
+            echo "  GPU RUNNER PREFLIGHT FAILED"
+            echo "  Aborting — fix the issues above before retrying."
+            exit 1
+          fi
+          echo "========================================"
+
+      # =====================================================================
+      # Phase 2: Notebook Runner Setup
+      # =====================================================================
+      - name: Download Notebook Runner
+        run: |
+          git clone --depth 1 https://x-access-token:${{ github.token }}@github.com/bp-cicd-org/qa-tester.git _qa_tester
+          cp _qa_tester/utils/notebook_runner/notebook_runner_nbclient.py .
+          rm -rf _qa_tester
+          chmod +x notebook_runner_nbclient.py
+
+      - name: Install Notebook Dependencies
+        run: |
+          pip install --break-system-packages --upgrade pip
+          pip install --break-system-packages ipykernel nbclient nbformat jupyter nbconvert
+          python3 -m ipykernel install --user --name python3 --display-name "Python 3"
+
+      # =====================================================================
+      # Phase 3: Pre-configure for CI
+      # =====================================================================
+      - name: Create Environment Files
+        run: |
+          # Build .env with echo (not heredoc) to guarantee no leading whitespace.
+          # Docker Compose .env parser is strict about KEY=VALUE format.
+          # ~/.env  — sourced by notebook cell 49 before docker compose up.
+          # deploy/.env — picked up by Docker Compose automatically.
+          {
+            echo "MONGO_USERNAME=${MONGO_USERNAME}"
+            echo "MONGO_PASSWORD=${MONGO_PASSWORD}"
+            echo "REDIS_PASSWORD=${REDIS_PASSWORD}"
+            echo "NVIDIA_API_KEY=${NVIDIA_API_KEY}"
+            echo "NGC_API_KEY=${NGC_API_KEY}"
+            echo "LLM_JUDGE_API_KEY=${NVIDIA_API_KEY}"
+            echo "EMB_API_KEY=${NVIDIA_API_KEY}"
+            echo "HF_TOKEN=${HF_TOKEN}"
+            echo "ES_COLLECTION_NAME=${ES_COLLECTION_NAME}"
+            echo "TAG=${TAG}"
+            echo "COMPOSE_PROFILES=mlflow"
+          } > ~/.env
+
+          cp ~/.env deploy/.env
+
+      - name: Preprocess Notebook for CI
+        run: |
+          python3 << 'PREPROCESS'
+          import json
+
+          nb_path = 'notebooks/ai-model-distillation-financial-data.ipynb'
+          with open(nb_path) as f:
+              nb = json.load(f)
+
+          # Cell 5: Fix project_root for CI and preserve other variables
+          # that later cells depend on.
+          #
+          # Original cell 5 walks up parent dirs assuming the Brev Launchable
+          # layout (notebook_dir.parent / 'ai-model-distillation-for-financial-data').
+          # In CI, notebook_runner CWD = repo root (after actions/checkout), so
+          # project_root is just Path.cwd().
+          #
+          # IMPORTANT: original cell 5 also defines `data_dir = project_root /
+          # "data"` which is later referenced by cell 60. Earlier versions of
+          # this patch dropped that line, which surfaced as a NameError on
+          # cell 60 ("name 'data_dir' is not defined", run 26094142383). Keep
+          # data_dir here so downstream cells stay self-contained.
+          nb['cells'][5]['source'] = [
+              'from pathlib import Path\n',
+              'import os\n',
+              '\n',
+              'project_root = Path.cwd()\n',
+              'data_dir = project_root / "data"\n',
+              'data_dir.mkdir(parents=True, exist_ok=True)\n',
+              'print(f"Project root: {project_root}")\n',
+              'print(f"Data dir:     {data_dir}")\n',
+          ]
+
+          # Cell 7: Replace uv pip install with pip3 --break-system-packages.
+          # ARC runner Python is externally-managed (Debian policy). Both
+          # `uv pip install --system` and plain `pip3 install` refuse to work.
+          # --break-system-packages is the only way to install into system
+          # site-packages on this runner.
+          nb['cells'][7]['source'] = [
+              '!pip3 install --break-system-packages -r notebooks/requirements.txt -q\n',
+          ]
+
+          # Cell 9: Replace interactive getpass() with env var.
+          # The -e flag on notebook_runner injects NGC_API_KEY into the kernel
+          # environment; this cell just reads it into a Python variable.
+          nb['cells'][9]['source'] = [
+              'import os\n',
+              '\n',
+              'NGC_API_KEY = os.environ["NGC_API_KEY"]\n',
+              'os.environ["NGC_API_KEY"] = NGC_API_KEY\n',
+              'print(f"NGC_API_KEY is set ({len(NGC_API_KEY)} chars)")\n',
+          ]
+
+          # Cell 10: Remove --progress flag from deploy-nmp.sh.
+          # In CI we need full stdout/stderr for debugging; --progress hides
+          # all output behind a progress bar and redirects to /tmp/nemo-deploy.log.
+          cell10_src = ''.join(nb['cells'][10]['source'])
+          nb['cells'][10]['source'] = [
+              cell10_src.replace('./scripts/deploy-nmp.sh --progress',
+                                 './scripts/deploy-nmp.sh')
+          ]
+
+          # Cell 15: Resolve the dataset placeholder.
+          # Notebook ships with a TODO placeholder ("<<REPLACE WITH DATASET
+          # FROM HUGGINGFACE>>") that's meant to be filled in by the user.
+          # In CI we substitute the dataset name referenced in the adjacent
+          # markdown cell so notebook execution can proceed unattended.
+          # Source notebook is untouched; this patch lives only in CI.
+          cell15_src = ''.join(nb['cells'][15]['source'])
+          nb['cells'][15]['source'] = [
+              cell15_src.replace('<<REPLACE WITH DATASET FROM HUGGINGFACE>>',
+                                 'ic-fspml/stock_news_sentiment')
+          ]
+
+          # Cell 30: Bound the teacher-model label generation for CI.
+          # The notebook calls process_dataset(num_samples=None) which
+          # classifies every headline in the dataset via the 70B teacher
+          # NIM. On a single-node Minikube with 5 GPUs that exceeds the
+          # 3600s per-cell timeout. For CI we want a smoke test of the
+          # label-gen pipeline, not a full production run, so we cap.
+          #
+          # 200 (not 100) is chosen because the downstream flywheel job
+          # splits the labeled set into eval+val+train using config/
+          # config.yaml's data_split_config. sklearn's train_test_split
+          # requires test_size < n_samples; with eval_size=100 (after
+          # the runtime patch we drop to 20 in the workflow step
+          # "Patch config.yaml for CI Environment") and stratification
+          # dropping ~1 sample per rare class, 200 leaves enough
+          # headroom for meaningful fine-tune (~160 train samples).
+          # See run 26095886415 for the prior failure with 100 samples.
+          cell30_src = ''.join(nb['cells'][30]['source'])
+          nb['cells'][30]['source'] = [
+              cell30_src.replace('num_samples=None, concurrent=200',
+                                 'num_samples=200, concurrent=200')
+          ]
+
+          # Cell 98: Bound the post-fine-tune sanity check for CI.
+          # Same reasoning as cell 30 — the validation pass over the full
+          # dataset against the customized model would also exceed the
+          # per-cell timeout. Cap at 100 samples by slicing
+          # validation_dataset['train'] before passing it in.
+          cell98_src = ''.join(nb['cells'][98]['source'])
+          nb['cells'][98]['source'] = [
+              cell98_src.replace(
+                  'process_dataset(validation_dataset,ft_model_name, concurrent=200)',
+                  'process_dataset(validation_dataset,ft_model_name, num_samples=100, concurrent=200)'
+              )
+          ]
+
+          with open(nb_path, 'w') as f:
+              json.dump(nb, f, indent=1)
+
+          print(f"Preprocessed {nb_path}")
+          print(f"  Cell 5:  project_root = Path.cwd()")
+          print(f"  Cell 7:  pip3 --break-system-packages")
+          print(f"  Cell 9:  getpass() -> os.environ")
+          print(f"  Cell 10: deploy-nmp.sh without --progress")
+          print(f"  Cell 15: dataset placeholder -> ic-fspml/stock_news_sentiment")
+          print(f"  Cell 30: teacher labeling num_samples=None -> 100 (CI smoke)")
+          print(f"  Cell 98: validation sanity check num_samples=None -> 100 (CI smoke)")
+          PREPROCESS
+
+      - name: Patch deploy-nmp.sh for CI Environment
+        run: |
+          SCRIPT="scripts/deploy-nmp.sh"
+          echo "Applying runtime patches to $SCRIPT (source file is NOT modified in repo)"
+          echo ""
+
+          python3 << 'PATCH'
+          with open('scripts/deploy-nmp.sh') as f:
+              content = f.read()
+
+          patches_applied = []
+
+          # ── Patch 1: Guard systemd service registration ──────────────
+          # ARC runner has no systemd (PID 1 = run.sh). The systemd unit
+          # is only for auto-restart on reboot — irrelevant in CI.
+          # Wrap the tee + systemctl lines in: if pidof systemd; then ... fi
+
+          old = (
+              '  # Enable minikube to resume on restart\n'
+              '  echo """[Unit]'
+          )
+          new = (
+              '  # Enable minikube to resume on restart\n'
+              '  # CI-PATCH: Skip systemd when not PID 1\n'
+              '  if pidof systemd >/dev/null 2>&1; then\n'
+              '  echo """[Unit]'
+          )
+          if old in content:
+              content = content.replace(old, new, 1)
+              old_tail = (
+                  '  maybe_sudo systemctl daemon-reload\n'
+                  '  maybe_sudo systemctl enable minikube\n'
+                  '}'
+              )
+              new_tail = (
+                  '  maybe_sudo systemctl daemon-reload\n'
+                  '  maybe_sudo systemctl enable minikube\n'
+                  '  else\n'
+                  '    log "No systemd detected (CI/container) — skipping minikube service registration"\n'
+                  '  fi\n'
+                  '}'
+              )
+              content = content.replace(old_tail, new_tail, 1)
+              patches_applied.append("systemd guard")
+
+          # ── Patch 2: ImagePull tolerance in wait_for_pods() ──────────
+          # Original: die immediately on first ErrImagePull/ImagePullBackOff.
+          # Problem:  Large NeMo images (500MB+) can show transient ErrImagePull
+          #           while still pulling. K8s retries with backoff; the pod
+          #           often succeeds within a few minutes.
+          # Fix:      Tolerate up to 30 consecutive checks (30 × 10s = 5 min)
+          #           before dying. Reset counter when error clears.
+
+          # 2a: Insert counter variable before the while loop
+          old_loop = (
+              '  while true; do\n'
+              '    # Get current pod statuses'
+          )
+          new_loop = (
+              '  local _ci_imgpull_count=0\n'
+              '  local _CI_IMGPULL_MAX=60  # CI-PATCH: tolerate 60 checks (10 min)\n'
+              '\n'
+              '  while true; do\n'
+              '    # Get current pod statuses'
+          )
+          if old_loop in content:
+              content = content.replace(old_loop, new_loop, 1)
+
+              # 2b: Replace the immediate-die block with a counter-based one
+              old_imgpull = (
+                  '    # --- Premature exit for ImagePull errors ---\n'
+                  '    local image_pull_errors\n'
+                  '    image_pull_errors=$(echo "$pod_statuses" | grep -E "ImagePullBackOff|ErrImagePull" || true)\n'
+                  '    if [[ -n "$image_pull_errors" ]]; then\n'
+                  '      err "Detected ImagePull errors!"\n'
+                  '      echo "$image_pull_errors" >&2 # Show the specific pods with errors\n'
+                  '      warn "Gathering diagnostics for pods with ImagePull errors..."\n'
+                  '      # Extract pod names with errors and collect diagnostics\n'
+                  '      local error_pods=($(echo "$image_pull_errors" | awk \'{print $1}\'))\n'
+                  '      local err_dir="nemo-errors-$(date +%s)"\n'
+                  '      mkdir -p "$err_dir" || warn "Could not create error directory: $err_dir"\n'
+                  '      for pod in "${error_pods[@]}"; do\n'
+                  '        collect_pod_diagnostics "$pod" "$NAMESPACE" "$err_dir"\n'
+                  '      done\n'
+                  '      # Restore trap before dying\n'
+                  '      eval "$old_err_trap"\n'
+                  '      trap - SIGINT\n'
+                  '      die "Exiting due to ImagePull errors. Diagnostics collected to $err_dir (if possible)."\n'
+                  '    fi\n'
+                  '    # --- End ImagePull check ---'
+              )
+              new_imgpull = (
+                  '    # --- ImagePull error check (CI-PATCHED: tolerance) ---\n'
+                  '    local image_pull_errors\n'
+                  '    image_pull_errors=$(echo "$pod_statuses" | grep -E "ImagePullBackOff|ErrImagePull" || true)\n'
+                  '    if [[ -n "$image_pull_errors" ]]; then\n'
+                  '      _ci_imgpull_count=$((_ci_imgpull_count + 1))\n'
+                  '      warn "ImagePull errors detected (check $_ci_imgpull_count/$_CI_IMGPULL_MAX):"\n'
+                  '      echo "$image_pull_errors" >&2\n'
+                  '      if (( _ci_imgpull_count >= _CI_IMGPULL_MAX )); then\n'
+                  '        err "ImagePull errors persisted for $_ci_imgpull_count consecutive checks!"\n'
+                  '        warn "Gathering diagnostics for pods with ImagePull errors..."\n'
+                  '        local error_pods=($(echo "$image_pull_errors" | awk \'{print $1}\'))\n'
+                  '        local err_dir="nemo-errors-$(date +%s)"\n'
+                  '        mkdir -p "$err_dir" || warn "Could not create error directory: $err_dir"\n'
+                  '        for pod in "${error_pods[@]}"; do\n'
+                  '          collect_pod_diagnostics "$pod" "$NAMESPACE" "$err_dir"\n'
+                  '        done\n'
+                  '        eval "$old_err_trap"\n'
+                  '        trap - SIGINT\n'
+                  '        die "Exiting due to persistent ImagePull errors. Diagnostics collected to $err_dir (if possible)."\n'
+                  '      fi\n'
+                  '    else\n'
+                  '      _ci_imgpull_count=0\n'
+                  '    fi\n'
+                  '    # --- End ImagePull check ---'
+              )
+              content = content.replace(old_imgpull, new_imgpull, 1)
+              patches_applied.append("ImagePull tolerance (30 checks / 5 min)")
+
+          # ── Patch 3: Fix deprecated kube-rbac-proxy image registry ───
+          # NeMo Operator Helm chart v25.10.0 references
+          #   gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0
+          # which was removed from GCR (migrated to registry.k8s.io).
+          # We inject a `kubectl set image` after `helm install` + `sleep 20`
+          # to correct the image reference before wait_for_pods runs.
+
+          old_sleep = (
+              '    --password=$NGC_API_KEY\n'
+              '\n'
+              '  sleep 20\n'
+              '}'
+          )
+          new_sleep = (
+              '    --password=$NGC_API_KEY\n'
+              '\n'
+              '  sleep 20\n'
+              '\n'
+              '  # CI-PATCH: Fix deprecated gcr.io kube-rbac-proxy image.\n'
+              '  # gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0 was removed from GCR;\n'
+              '  # the canonical location is now registry.k8s.io.\n'
+              '  if kubectl get deployment nemo-nemo-operator-controller-manager -n "$NAMESPACE" &>/dev/null; then\n'
+              '    log "Fixing kube-rbac-proxy image reference (gcr.io → registry.k8s.io)..."\n'
+              '    kubectl set image deployment/nemo-nemo-operator-controller-manager \\\n'
+              '      kube-rbac-proxy=registry.k8s.io/kubebuilder/kube-rbac-proxy:v0.15.0 \\\n'
+              '      -n "$NAMESPACE" || warn "Could not patch kube-rbac-proxy image"\n'
+              '\n'
+              '    # CI-PATCH: wait for the rolling update to settle and clean up\n'
+              '    # the stale pod from the original (broken) ReplicaSet.\n'
+              '    # `helm install` already created a pod with the bad gcr.io image\n'
+              '    # that immediately enters ImagePullBackOff. The `set image` above\n'
+              '    # triggers a new ReplicaSet whose pod pulls the correct image and\n'
+              '    # becomes Ready. The Deployment controller eventually scales the\n'
+              '    # old RS to 0, but the dead pod can linger long enough for\n'
+              '    # deploy-nmp.sh\'s `check_pod_health` to see it and abort with\n'
+              '    # "Base cluster is not healthy" — even though the new pod is\n'
+              '    # already Running 2/2 (run 26115227627 reproduced this exactly).\n'
+              '    # We wait for the rollout to report success, then force-delete\n'
+              '    # any operator pods that are still in a non-Running phase so\n'
+              '    # the downstream health check only sees live pods.\n'
+              '    log "Waiting for nemo-operator rolling update to complete..."\n'
+              '    kubectl rollout status deployment/nemo-nemo-operator-controller-manager \\\n'
+              '      -n "$NAMESPACE" --timeout=300s \\\n'
+              '      || warn "Rollout did not finish within 300s; will force-clean stale pods"\n'
+              '\n'
+              '    stale_pods=$(kubectl get pods -n "$NAMESPACE" \\\n'
+              '      --field-selector=status.phase!=Running --no-headers 2>/dev/null \\\n'
+              '      | awk \'/^nemo-nemo-operator-controller-manager/ {print $1}\')\n'
+              '    if [[ -n "$stale_pods" ]]; then\n'
+              '      log "Force-deleting stale operator pods stuck on old image:"\n'
+              '      echo "$stale_pods" | while read -r _ci_p; do\n'
+              '        log "  $_ci_p"\n'
+              '        kubectl delete pod "$_ci_p" -n "$NAMESPACE" \\\n'
+              '          --force --grace-period=0 2>/dev/null || true\n'
+              '      done\n'
+              '    fi\n'
+              '  fi\n'
+              '}'
+          )
+          if old_sleep in content:
+              content = content.replace(old_sleep, new_sleep, 1)
+              patches_applied.append("kube-rbac-proxy image fix (gcr.io → registry.k8s.io)")
+
+          # Patch 4 + Patch 7: after `minikube addons enable ingress`, copy
+          # host ~/.docker/config.json into kubelet (auth) and load pre-pulled
+          # images (avoid pull).
+          old_ingress = (
+              '  log "Enabling ingress addon..."\n'
+              '  minikube addons enable ingress\n'
+          )
+          new_ingress = (
+              '  log "Enabling ingress addon..."\n'
+              '  minikube addons enable ingress\n'
+              '\n'
+              '  # CI-PATCH 7: propagate docker.io auth to minikube kubelet.\n'
+              '  if [ -f "$HOME/.docker/config.json" ] && grep -q "index.docker.io\\|docker.io" "$HOME/.docker/config.json" 2>/dev/null; then\n'
+              '    log "CI: propagating docker auth to minikube kubelet"\n'
+              '    if docker cp "$HOME/.docker/config.json" minikube:/var/lib/kubelet/config.json 2>/dev/null \\\n'
+              '       && docker exec minikube chmod 600 /var/lib/kubelet/config.json 2>/dev/null; then\n'
+              '      log "CI: minikube kubelet authenticated"\n'
+              '    else\n'
+              '      warn "CI: docker cp to minikube failed — in-cluster pulls remain anonymous"\n'
+              '    fi\n'
+              '  else\n'
+              '    warn "CI: no docker.io entry in $HOME/.docker/config.json — in-cluster pulls remain anonymous"\n'
+              '  fi\n'
+              '\n'
+              '  # CI-PATCH 4: load host-prepulled images into minikube.\n'
+              '  for _ci_img in \\\n'
+              '    volcanosh/vc-scheduler:v1.9.0 \\\n'
+              '    volcanosh/vc-controller-manager:v1.9.0 \\\n'
+              '    volcanosh/vc-webhook-manager:v1.9.0 \\\n'
+              '    bitnamilegacy/postgresql:17.2.0-debian-12-r1 \\\n'
+              '    bitnamilegacy/postgresql:16.1.0-debian-11-r20 \\\n'
+              '    bitnamilegacy/postgresql:16.2.0-debian-11-r1; do\n'
+              '    if docker image inspect "$_ci_img" >/dev/null 2>&1; then\n'
+              '      log "CI: loading $_ci_img into minikube..."\n'
+              '      minikube image load "$_ci_img" \\\n'
+              '        || warn "CI: minikube image load failed for $_ci_img"\n'
+              '    else\n'
+              '      warn "CI: $_ci_img not on host (pre-pull may have failed)"\n'
+              '    fi\n'
+              '  done\n'
+          )
+          if old_ingress in content:
+              content = content.replace(old_ingress, new_ingress, 1)
+              patches_applied.append("minikube image load + kubelet docker auth (Docker Hub rate-limit bypass)")
+
+          # Patch 5: extend helm install timeout to 15m so the pre-install hook
+          # waits long enough for Docker Hub anon pulls to recover after a
+          # short-window rate-limit (default 5m is too tight).
+          old_helm = (
+              '  helm install nemo "$HELM_CHART_REPO" "${version_args[@]}" -f demo-values.yaml --namespace "$NAMESPACE" \\\n'
+              '    --username=\'$oauthtoken\' \\\n'
+              '    --password=$NGC_API_KEY\n'
+          )
+          new_helm = (
+              '  helm install nemo "$HELM_CHART_REPO" "${version_args[@]}" -f demo-values.yaml --namespace "$NAMESPACE" \\\n'
+              '    --username=\'$oauthtoken\' \\\n'
+              '    --password=$NGC_API_KEY \\\n'
+              '    --timeout 15m\n'
+          )
+          if old_helm in content:
+              content = content.replace(old_helm, new_helm, 1)
+              patches_applied.append("helm install --timeout 15m (rate-limit recovery)")
+
+          # Patch 6: volcano-development.yaml ships imagePullPolicy=Always, so
+          # kubelet always re-pulls and hits Docker Hub rate-limit even when
+          # the image is already loaded into minikube via Patch 4. Right after
+          # `kubectl apply volcano-development.yaml`, patch the volcano
+          # deployments to IfNotPresent and bounce their pods so the new
+          # policy takes effect.
+          old_volcano = (
+              '  kubectl apply -f https://raw.githubusercontent.com/volcano-sh/volcano/v${volcano_version}/installer/volcano-development.yaml\n'
+              '\n'
+              '  sleep 15\n'
+          )
+          new_volcano = (
+              '  kubectl apply -f https://raw.githubusercontent.com/volcano-sh/volcano/v${volcano_version}/installer/volcano-development.yaml\n'
+              '\n'
+              '  # CI-PATCH: flip imagePullPolicy Always -> IfNotPresent so locally-loaded images are used.\n'
+              '  for _ci_dep in volcano-scheduler volcano-controllers volcano-admission; do\n'
+              '    kubectl patch deployment "$_ci_dep" -n volcano-system --type=json \\\n'
+              '      -p=\'[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]\' \\\n'
+              '      >/dev/null 2>&1 || warn "CI: could not patch $_ci_dep imagePullPolicy"\n'
+              '  done\n'
+              '  kubectl delete pods -n volcano-system --all --grace-period=0 --force >/dev/null 2>&1 || true\n'
+              '\n'
+              '  sleep 15\n'
+          )
+          if old_volcano in content:
+              content = content.replace(old_volcano, new_volcano, 1)
+              patches_applied.append("volcano imagePullPolicy IfNotPresent")
+
+          with open('scripts/deploy-nmp.sh', 'w') as f:
+              f.write(content)
+
+          print(f"Applied {len(patches_applied)} patch(es):")
+          for p in patches_applied:
+              print(f"  ✓ {p}")
+          if not patches_applied:
+              print("  WARNING: No patches matched — deploy-nmp.sh may have changed upstream")
+          PATCH
+
+          echo ""
+          echo "Verifying patches:"
+          grep -cn "pidof systemd" "$SCRIPT" | xargs -I{} echo "  ✓ systemd guard: {} match(es)"
+          grep -cn "_CI_IMGPULL_MAX" "$SCRIPT" | xargs -I{} echo "  ✓ ImagePull tolerance: {} match(es)"
+          grep -cn "registry.k8s.io/kubebuilder" "$SCRIPT" | xargs -I{} echo "  ✓ kube-rbac-proxy fix: {} match(es)"
+          grep -cn "Waiting for nemo-operator rolling update" "$SCRIPT" | xargs -I{} echo "  ✓ rollout wait + stale-pod cleanup: {} match(es)"
+          grep -cn "CI: propagating docker auth to minikube" "$SCRIPT" | xargs -I{} echo "  ✓ kubelet docker auth propagation (Patch 7): {} match(es)"
+          grep -cn "CI: loading" "$SCRIPT" | xargs -I{} echo "  ✓ minikube image load: {} match(es)"
+          grep -cn -- "--timeout 15m" "$SCRIPT" | xargs -I{} echo "  ✓ helm install --timeout 15m: {} match(es)"
+          grep -cn "CI: flip imagePullPolicy" "$SCRIPT" | xargs -I{} echo "  ✓ volcano imagePullPolicy patch: {} match(es)"
+
+      # =====================================================================
+      # Phase 3.5: Pre-Cleanup — Remove stale containers from prior runs
+      # ARC runners share the host Docker daemon. If a previous CI run's
+      # cleanup was incomplete (crash, timeout, cancellation), orphaned
+      # minikube containers/networks will conflict with the new run.
+      # =====================================================================
+      - name: Patch config.yaml for CI Environment
+        run: |
+          # Same pattern as the deploy-nmp.sh patch above: the dev team's
+          # config/config.yaml in the repo is untouched in git. We mutate
+          # the checked-out copy on the runner only for this workflow run.
+          #
+          # Why: config/config.yaml ships with eval_size=100 (production
+          # default). The Preprocess Notebook for CI step caps teacher-
+          # model label generation at 200 samples (cell 30); the flywheel
+          # then asks sklearn.train_test_split for test_size=100 from
+          # ~199 stratified samples. That works, but leaves very little
+          # for training (~80 train samples). Lowering eval_size to 20
+          # rebalances the split to ~160 train / 18 val / 20 eval, which
+          # is the minimum for the LoRA fine-tune step to produce a
+          # customized model that downstream cells (89-103) can read.
+          # See run 26095886415 for the prior failure where eval_size=
+          # 100 against n=99 samples crashed the flywheel job.
+          # Lower training_config.batch_size 64 -> 8: CI dataset gives val_size ~18
+          # and NeMo trainer requires global_batch_size <= n_validation_samples.
+
+          # Why surgical regex instead of yaml.safe_dump round-trip:
+          # An earlier version of this step parsed the YAML with PyYAML and
+          # wrote it back with safe_dump. That reformatted the `nims:` block
+          # to PyYAML's default style (list items flush-left at column 0).
+          # Notebook cell 47 then runs a regex (?ms)^(nims:[\s\S]*?)(?=^\S|\Z)
+          # to swap the NIMs block. The negative lookahead matches the very
+          # first flush-left `- model_name:` line, so the replacement only
+          # consumes `nims:\n` and leaves the old list items as orphans
+          # below the new ones -> duplicate keys -> YAML ParserError when
+          # any later cell loads the config. (Seen in run 26097895803.)
+          #
+          # The fix is a surgical line-level substitution that only changes
+          # the two integers we care about. Every byte of formatting -
+          # indentation, blank lines, comments - is preserved as-is, so the
+          # cell 47 regex behaves exactly as it did against the original
+          # source file.
+          python3 << 'PATCH_CFG'
+          import re
+
+          path = 'config/config.yaml'
+          with open(path) as f:
+              text = f.read()
+
+          before = {}
+          for key in ('eval_size', 'min_total_records', 'batch_size'):
+              m = re.search(rf'(?m)^\s*{key}:\s*(\d+)', text)
+              before[key] = m.group(1) if m else None
+
+          text = re.sub(
+              r'(?m)^(\s*eval_size:\s*)\d+(\s*(?:#.*)?)$',
+              r'\g<1>20\g<2>',
+              text,
+          )
+          text = re.sub(
+              r'(?m)^(\s*min_total_records:\s*)\d+(\s*(?:#.*)?)$',
+              r'\g<1>30\g<2>',
+              text,
+          )
+          text = re.sub(
+              r'(?m)^(\s*batch_size:\s*)\d+(\s*(?:#.*)?)$',
+              r'\g<1>8\g<2>',
+              text,
+          )
+
+          if (
+              'eval_size: 20' not in text
+              or 'min_total_records: 30' not in text
+              or 'batch_size: 8' not in text
+          ):
+              raise SystemExit('config.yaml patch failed: target keys not rewritten')
+
+          with open(path, 'w') as f:
+              f.write(text)
+
+          print(f"data_split_config.eval_size:         {before['eval_size']} -> 20")
+          print(f"data_split_config.min_total_records: {before['min_total_records']} -> 30")
+          print(f"training_config.batch_size:          {before['batch_size']} -> 8")
+          print("config.yaml patched for CI (source file in git is unchanged).")
+          PATCH_CFG
+
+      - name: Docker Hub Login
+        run: |
+          if [ -z "${DOCKERHUB_USERNAME}" ] || [ -z "${DOCKERHUB_TOKEN}" ]; then
+            echo "WARN: DOCKERHUB_USERNAME/DOCKERHUB_TOKEN missing — pulls stay anonymous."
+            exit 0
+          fi
+          if echo "${DOCKERHUB_TOKEN}" | docker login docker.io -u "${DOCKERHUB_USERNAME}" --password-stdin; then
+            echo "OK: authenticated as ${DOCKERHUB_USERNAME}"
+          else
+            echo "FAIL: docker login docker.io failed"
+          fi
+
+      - name: Pre-pull Docker Hub Images
+        run: |
+          echo "========================================"
+          echo "  PRE-PULL DOCKER HUB IMAGES"
+          echo "========================================"
+          IMAGES=(
+            "docker.io/volcanosh/vc-scheduler:v1.9.0"
+            "docker.io/volcanosh/vc-controller-manager:v1.9.0"
+            "docker.io/volcanosh/vc-webhook-manager:v1.9.0"
+            "docker.io/bitnamilegacy/postgresql:17.2.0-debian-12-r1"
+            "docker.io/bitnamilegacy/postgresql:16.1.0-debian-11-r20"
+            "docker.io/bitnamilegacy/postgresql:16.2.0-debian-11-r1"
+          )
+          for img in "${IMAGES[@]}"; do
+            short="${img#docker.io/}"
+            echo ""
+            echo "--- Pulling $short ---"
+            ok=0
+            for attempt in 1 2 3 4 5; do
+              docker pull "$img" 2>&1 | tail -5
+              pull_exit=${PIPESTATUS[0]}
+              if [ $pull_exit -eq 0 ]; then
+                ok=1
+                docker tag "$img" "$short" 2>/dev/null || true
+                echo "  OK on attempt $attempt"
+                break
+              fi
+              wait=$((attempt * 30))
+              echo "  attempt $attempt/5 failed (exit=$pull_exit) — sleeping ${wait}s before retry"
+              sleep "$wait"
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "  WARN: could not pre-pull $short (in-cluster pull will retry via Patch 2 tolerance)"
+            fi
+          done
+          echo ""
+          echo "--- Pre-pulled images on host ---"
+          docker images | grep -E "volcanosh|bitnamilegacy" || echo "(none)"
+
+      - name: Pre-Cleanup Stale Docker Resources
+        run: |
+          echo "Cleaning up stale Docker resources from prior runs..."
+
+          # 1. Try minikube CLI (may not be installed on fresh pod)
+          minikube delete 2>/dev/null && echo "  Deleted stale minikube cluster" || echo "  No stale minikube CLI or cluster"
+
+          # 2. Remove minikube containers by name (these live on the HOST Docker)
+          for c in minikube minikube-preload-sidecar; do
+            docker rm -f "$c" 2>/dev/null && echo "  Removed stale container: $c" || true
+          done
+
+          # 3. Remove any other minikube-labeled containers
+          docker rm -f $(docker ps -aq --filter "label=created_by.minikube.sigs.k8s.io=true") 2>/dev/null && echo "  Removed minikube-labeled containers" || true
+
+          # 4. Stop stale Docker Compose services (port conflicts: 8000, 9200, etc.)
+          docker compose -f deploy/docker-compose.yaml down -v 2>/dev/null && echo "  Stopped stale compose services" || true
+
+          # 5. Prune orphaned networks and volumes
+          docker network prune -f 2>/dev/null || true
+          docker volume prune -f 2>/dev/null || true
+
+          echo "Pre-cleanup done."
+
+      # =====================================================================
+      # Phase 4: Execute Notebook
+      # =====================================================================
+      - name: Execute Notebook
+        run: |
+          echo "========================================"
+          echo "  EXECUTING NOTEBOOK"
+          echo "========================================"
+          echo ""
+          echo "Skip list: 3 45 81 83 85 87 104 106 108"
+          echo "  3:   git clone (already checked out)"
+          echo "  45:  self-hosted setup (commented-out block)"
+          echo "  81:  optional 10K flywheel job"
+          echo "  83:  optional 10K monitor"
+          echo "  85:  optional 25K flywheel job"
+          echo "  87:  optional 25K monitor"
+          echo "  104: LoRA adapter download (Brev)"
+          echo "  106: kubectl port-forward (Brev)"
+          echo "  108: external URL inference (Brev)"
+          echo ""
+
+          python3 notebook_runner_nbclient.py \
+            -f notebooks/ai-model-distillation-financial-data.ipynb \
+            --output-dir notebook_output \
+            --timeout 3600 \
+            --skip-deps-check \
+            --skip-cells 3 45 81 83 85 87 104 106 108 \
+            -e NGC_API_KEY="${NGC_API_KEY}" \
+            -e NVIDIA_API_KEY="${NVIDIA_API_KEY}" \
+            -e MONGO_USERNAME="${MONGO_USERNAME}" \
+            -e MONGO_PASSWORD="${MONGO_PASSWORD}" \
+            -e REDIS_PASSWORD="${REDIS_PASSWORD}" \
+            -e HF_TOKEN="${HF_TOKEN}" \
+            -e ES_COLLECTION_NAME="${ES_COLLECTION_NAME}" \
+            -e TAG="${TAG}"
+
+          echo ""
+          echo "Notebook execution completed."
+          echo "Generated files:"
+          ls -la notebook_output/
+
+      # =====================================================================
+      # Phase 5: Post-Notebook Validation
+      # =====================================================================
+      - name: Verify Service Health
+        if: always()
+        run: |
+          echo "========================================"
+          echo "  POST-NOTEBOOK SERVICE HEALTH CHECK"
+          echo "========================================"
+          echo ""
+
+          HEALTH="PASS"
+
+          # API Server
+          echo "--- API Server (port 8000) ---"
+          API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8000/api/jobs" 2>/dev/null || echo "000")
+          if [ "$API_STATUS" = "200" ]; then
+            echo "PASS: API Server (HTTP $API_STATUS)"
+          else
+            echo "FAIL: API Server (HTTP $API_STATUS)"
+            HEALTH="FAIL"
+          fi
+
+          # Elasticsearch
+          echo "--- Elasticsearch (port 9200) ---"
+          ES_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:9200/_cluster/health" 2>/dev/null || echo "000")
+          if [ "$ES_STATUS" = "200" ]; then
+            echo "PASS: Elasticsearch (HTTP $ES_STATUS)"
+          else
+            echo "FAIL: Elasticsearch (HTTP $ES_STATUS)"
+            HEALTH="FAIL"
+          fi
+
+          # Redis
+          echo "--- Redis (port 6379) ---"
+          REDIS_CONTAINER=$(docker ps -qf "name=redis" | head -1)
+          if [ -n "$REDIS_CONTAINER" ] && docker exec "$REDIS_CONTAINER" redis-cli -a "$REDIS_PASSWORD" ping 2>/dev/null | grep -q "PONG"; then
+            echo "PASS: Redis"
+          else
+            echo "FAIL: Redis"
+            HEALTH="FAIL"
+          fi
+
+          # MongoDB
+          echo "--- MongoDB (port 27017) ---"
+          MONGO_CONTAINER=$(docker ps -qf "name=mongodb" | head -1)
+          if [ -n "$MONGO_CONTAINER" ] && docker exec "$MONGO_CONTAINER" mongosh --eval "db.runCommand('ping').ok" --quiet -u "$MONGO_USERNAME" -p "$MONGO_PASSWORD" 2>/dev/null | grep -q "1"; then
+            echo "PASS: MongoDB"
+          else
+            echo "FAIL: MongoDB"
+            HEALTH="FAIL"
+          fi
+
+          # MLflow
+          echo "--- MLflow (port 5000) ---"
+          MLFLOW_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:5000/" 2>/dev/null || echo "000")
+          if [ "$MLFLOW_STATUS" = "200" ]; then
+            echo "PASS: MLflow (HTTP $MLFLOW_STATUS)"
+          else
+            echo "FAIL: MLflow (HTTP $MLFLOW_STATUS)"
+            HEALTH="FAIL"
+          fi
+
+          echo ""
+          echo "--- Container Status ---"
+          docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true
+
+          echo ""
+          if [ "$HEALTH" = "PASS" ]; then
+            echo "ALL SERVICES HEALTHY"
+          else
+            echo "SOME SERVICES UNHEALTHY (notebook may have failed at deployment step)"
+            exit 1
+          fi
+
+      # Phase 5b: shared QA-image pytest (markers T5550841..T5614424).
+      # --dfw-api-url is the QA image's CLI contract; we feed it the local API URL.
+      - name: Run shared QA-image API tests
+        if: ${{ success() && (github.event_name != 'workflow_dispatch' || inputs.run_shared_qa) }}
+        env:
+          TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${TEST_REPORT_DIR}"
+          pull_key="${TEST_DOCKER_PULL_KEY:-${NGC_API_KEY}}"
+          echo "${pull_key}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          docker pull "${QA_TEST_IMAGE}"
+
+          docker run --rm --network host \
+            -v "$(pwd)/${TEST_REPORT_DIR}:/app/reports" \
+            "${QA_TEST_IMAGE}" \
+            pytest \
+              testcases/ai_model_distillation/test_ai_model_distillation_api.py \
+              -m "ai_model_distillation and api" \
+              --dfw-api-url "${API_URL}" \
+              --html=/app/reports/api-test.html \
+              --self-contained-html \
+              --disable-warnings \
+              -v
+
+      - name: Run Unit Tests (T5614423)
+        if: success()
+        run: |
+          set -euo pipefail
+          pip install --break-system-packages -e .
+          pip install --break-system-packages pytest pytest-html
+          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p "${TEST_REPORT_DIR}"
+          python3 -m pytest tests/unit/lib/flywheel/test_util.py \
+            -m T5614423 \
+            --html="${TEST_REPORT_DIR}/unit-T5614423.html" \
+            --self-contained-html \
+            --disable-warnings \
+            -v
+
+      - name: Run Worker SIGTERM Test (T5614424)
+        if: success()
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          python3 -m pytest tests/integration/test_worker_sigterm.py \
+            --override-ini="addopts=" \
+            --html="${TEST_REPORT_DIR}/integration-T5614424.html" \
+            --self-contained-html \
+            --disable-warnings \
+            -v
+
+      - name: Upload Test Reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: api-test-report
+          path: test_reports/*.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # =====================================================================
+      # Phase 6: Notebook Artifacts
+      # =====================================================================
+      - name: Upload Notebook HTML
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: notebook-html-report
+          path: notebook_output/*.html
+          retention-days: 30
+
+      - name: Upload Executed Notebook
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: executed-notebook
+          path: notebook_output/*.ipynb
+          retention-days: 30
+
+      # =====================================================================
+      # Phase 7: Cleanup
+      # ALWAYS runs. Critical because containers live on the HOST (via Docker
+      # socket mount) and will NOT be cleaned up when the runner pod dies.
+      # =====================================================================
+      - name: Collect Logs on Failure
+        if: failure()
+        run: |
+          echo "========================================"
+          echo "  COLLECTING LOGS FOR DEBUGGING"
+          echo "========================================"
+          echo ""
+          echo "--- deploy-nmp.sh Log (/tmp/nemo-deploy.log) ---"
+          if [ -f /tmp/nemo-deploy.log ]; then
+            cat /tmp/nemo-deploy.log
+          else
+            echo "(log file not found — deploy-nmp.sh may not have started)"
+          fi
+          echo ""
+          echo "--- Docker Compose Logs ---"
+          docker compose -f deploy/docker-compose.yaml logs --tail=50 2>/dev/null || true
+          echo ""
+          echo "--- Minikube Logs ---"
+          minikube logs --length=50 2>/dev/null || true
+          echo ""
+          echo "--- Kubernetes Pods ---"
+          kubectl get pods -A 2>/dev/null || true
+          echo ""
+          echo "--- Failed Pod Logs ---"
+          for pod in $(kubectl get pods --no-headers 2>/dev/null | grep -v Running | awk '{print $1}'); do
+            echo "=== $pod ==="
+            kubectl logs "$pod" --tail=20 2>/dev/null || true
+          done
+
+      - name: Cleanup
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.keep_stack) }}
+        run: |
+          echo "========================================"
+          echo "  CLEANUP"
+          echo "========================================"
+          docker compose -f deploy/docker-compose.yaml down -v 2>/dev/null || true
+          minikube delete 2>/dev/null || true
+          docker rm -f $(docker ps -aq) 2>/dev/null || true
+          docker network prune -f 2>/dev/null || true
+          docker volume prune -f 2>/dev/null || true
+          docker rmi "${QA_TEST_IMAGE}" 2>/dev/null || true
+          docker image prune -f 2>/dev/null || true
+          echo "Cleanup completed."
+
+  # ===========================================================================
+  # SUMMARY: Collect results and notify (runs on cheap runner)
+  # ===========================================================================
+  summary:
+    name: Summary & Notification
+    needs: [preflight, notebook-ci]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+        continue-on-error: true
+
+      - name: Generate Summary
+        run: |
+          echo "# AI Model Distillation CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Generated: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Preflight | ${{ needs.preflight.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Notebook CI | ${{ needs.notebook-ci.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -d "artifacts" ]; then
+            echo "| File | Size |" >> $GITHUB_STEP_SUMMARY
+            echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+            find artifacts -type f \( -name "*.html" -o -name "*.ipynb" \) 2>/dev/null | while read f; do
+              SIZE=$(du -h "$f" | cut -f1)
+              echo "| $(basename "$f") | $SIZE |" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "No artifacts available." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Set Result Output
+        id: set_result
+        if: always()
+        run: |
+          if [ "${{ needs.preflight.result }}" == "success" ] && \
+             [ "${{ needs.notebook-ci.result }}" == "success" ]; then
+            echo "RESULT=PASS" >> $GITHUB_OUTPUT
+          else
+            echo "RESULT=FAIL" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Email Notification
+        uses: dawidd6/action-send-mail@6e71c855c9a091d80a519621b9fd3e8d252ca40c
+        if: always() && env.ENABLE_EMAIL_NOTIFICATION == 'true'
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "CI Result: AI Model Distillation - ${{ steps.set_result.outputs.RESULT }}"
+          to: Github-Action-Blueprint-QA@nvidia.com
+          from: github-workflow-notification@gmail.com
+          html_body: |
+            <h2>AI Model Distillation for Financial Data - CI</h2>
+
+            <p><strong>Repository:</strong> ${{ github.repository }}</p>
+            <p><strong>Branch:</strong> ${{ github.ref_name }}</p>
+            <p><strong>Commit:</strong> <code>${{ github.sha }}</code></p>
+            <p><strong>Triggered by:</strong> ${{ github.actor }} (${{ github.event_name }})</p>
+            <p><strong>Result:</strong>
+              <span style="color: ${{ steps.set_result.outputs.RESULT == 'PASS' && 'green' || 'red' }}; font-weight: bold;">
+                ${{ steps.set_result.outputs.RESULT }}
+              </span>
+            </p>
+
+            <h3>Job Results</h3>
+            <table border="1" cellpadding="5" cellspacing="0">
+              <tr><th>Job</th><th>Status</th></tr>
+              <tr><td>Preflight</td><td>${{ needs.preflight.result }}</td></tr>
+              <tr><td>Notebook CI</td><td>${{ needs.notebook-ci.result }}</td></tr>
+            </table>
+
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View Workflow Run</a></p>
+            <p><em>Notebook HTML report is available in the workflow artifacts.</em></p>
