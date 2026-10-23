@@ -241,7 +241,7 @@ class Customizer:
 
             if time.time() - start_time > timeout:
                 msg = (
-                    f"Model {customized_model} did not sync within {timeout} second: {models_data}"
+                    f"Model {customized_model} did not sync within {timeout} seconds: {models_data}"
                 )
                 logger.error(msg)
                 raise TimeoutError(msg)

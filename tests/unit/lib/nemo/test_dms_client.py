@@ -438,7 +438,7 @@ class TestDMSClientWaitForModelSync:
             patch("src.lib.nemo.dms_client.logger.error"),  # Suppress logging
         ):
             with pytest.raises(
-                TimeoutError, match="Model test-model did not sync within 10 second"
+                TimeoutError, match="Model test-model did not sync within 10 seconds"
             ):
                 dms_client.wait_for_model_sync(
                     "test-model", "test-run-id", check_interval=1, timeout=10
