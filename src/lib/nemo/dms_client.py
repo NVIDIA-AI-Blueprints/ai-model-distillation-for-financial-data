@@ -160,7 +160,7 @@ class DMSClient:
                 return {"status": "synced", "model_id": model_name}
 
             if time.time() - start_time > timeout:
-                msg = f"Model {model_name} did not sync within {timeout} second: {models_data}"
+                msg = f"Model {model_name} did not sync within {timeout} seconds: {models_data}"
                 logger.error(msg)
                 raise TimeoutError(msg)
             # wait before next check
